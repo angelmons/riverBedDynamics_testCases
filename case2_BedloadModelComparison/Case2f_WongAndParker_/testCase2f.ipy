@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan  2 13:42:22 2024
+
+@author: angelmonsalve
+
+Driver file for: 
+Case 2f bedload model comparison - no subsurface updating 
+Wong and Parker
+
+"""
+
+""" Loads components and other libraries"""
+%reset -f
+
+import numpy as np
+from matplotlib import pyplot as plt
+import matplotlib.cm as cm
+
+from landlab.components import OverlandFlow, RiverBedDynamics
+from landlab.io import read_esri_ascii
+from landlab import imshow_grid
+from landlab.grid.mappers import map_mean_of_link_nodes_to_link
+
+import copy
+import os
+import shutil
+
+""" Clean old files and the putput folder before starting the simulation """
+directory = os.getcwd() ; test = os.listdir( directory )
+
+for item in test:
+    if item.endswith(".png"):
+        os.remove( os.path.join( directory, item ) )
+
+output_folder = 'output'
+cwd = os.getcwd()
+
+if os.path.exists(output_folder):
+    print('The folder ' + output_folder + ' Exists and it will be removed \n');
+    shutil.rmtree(output_folder)     
+os.mkdir(output_folder)
+
+""" Numerical simulation conditions and time control settings"""
+# inputs filenames
+zDEM = 'bedElevationDEM.asc'        # ASCII raster DEM containing the bed surface elevation
+gsd = np.loadtxt('bed_gsd.txt')     # Check inside the txt file for more information on the file format
+
+# Time variables
+t = 0
+t0 = 0                              # Elapsed time used when getting th initial conditions (sec)
+max_dt = 5                          # Overland flow will use the min time step between this value and the automatically calculated. Use seconds.
+
+# Initial conditions settings
+sim_max_t_0 = 86400                 # Maximum simulation time used when getting the initial conditions in sec
+
+# Simulation conditions settings
+sim_max_t = 121 * 86400 + max_dt    # Maximum simulation time
+save_data_time_interval = 86400     # Stores results every this time
+dt_precision = 3                    # Avoids rounding errors
+plot_time_interval = 86400          # Plots will be obtained every this seconds
+
+# General simulation conditions
+n = 0.0275                          # Manning's n
+in_qb = 0.0075                      # bedload rate at inlet link in m3/s - Positive towards right, Negative towards left
+in_l = np.array((71,140))           # Links Id in which sediment supply and discharge enters
+in_n = np.array((36,71))            # Node Id in which water depth is specified
+fixed_nodes_id = np.array((33,34,68,69,103,104,138,139))                    # Node ID for fixed Nodes - These will not change elevation
+calc_node_id = np.array((2,1,0,37,36,35,72,71,70,107,106,105))              # Node ID for nodes that are calculated as zero gradient in boundary conditions for bed elevation  
+fixed_bed_gsd_nodes_id = np.array((0,1,2,35,36,37,70,71,72,105,106,107))    # Node ID for fixed bed surface GSD nodes
+qb_gsd_imposed0 = np.array([0.05,0.15,0.3,0.25,0.15,0.05,0.05])             # fixed imposed sediment supply GSD
+link_list = np.arange(69,103)     # Location of the links where information for postprocess will be extracted 
+node_list = np.arange(35,70)      # Location of the nodes where information for postprocess will be extracted 
+rainfall_intensity = 0.02         # Precipitation in m/s
+studyRegion_outlet_node_id = 100  # Node Id for the outlet node in the study zone - Used to check if water depth initial conditions is OK
+
+""" OverlandFlow intantiation conditions """       
+# Creates fields and instantiate the OverlandFlow component
+OverlandFlow.input_var_names                                                # Gives the list of all required fields                                  
+(rmg, z) = read_esri_ascii(zDEM, name='topographic__elevation')             # Creates the topographic__elevation field
+rmg.add_zeros('surface_water__depth', at = 'node')                          # Creates the surface_water__depth field
+of = OverlandFlow(rmg, h_init=0.001,mannings_n=n,rainfall_intensity=0.0)    # instantiate the Overland flow component
+of._rainfall_intensity =  np.zeros_like(z,dtype=float)
+of._rainfall_intensity[in_n] = rainfall_intensity                           # Precipitation in m/s
+
+""" RiverBedDynamics intantiation conditions """
+# surface_water__depth and topographic__elevation were already created 
+RiverBedDynamics.input_var_names #('surface_water__depth', 'surface_water__velocity', 'topographic__elevation')
+RiverBedDynamics.var_mapping     # Tells where those fields have to be mapped
+rmg["link"]["surface_water__depth"] = map_mean_of_link_nodes_to_link(rmg, "surface_water__depth") # surface_water__depth was created at nodes
+rmg.add_zeros('surface_water__velocity', at = 'node')
+rmg.add_zeros('surface_water__velocity', at = 'link')
+
+""" Simulation boundary conditions """
+# Set boundaries as closed boundaries, the outlet is set to an open boundary. 
+rmg.set_watershed_boundary_condition_outlet_id([69,104], z, 45.)
+
+# Creates optional fields that will be used in the simulation
+# fixed_nodes defines as 1 if a node is fixed or 0 if it can varies in elevation
+fixed_nodes = np.zeros_like(z)  
+fixed_nodes[fixed_nodes_id] = 1
+# sediment_transport__sediment_supply_imposed
+qb = np.full(rmg.number_of_links, 0.0)
+qb[in_l] = in_qb
+# Creates the fixed bed surface GSD Nodes location information - 1 is fixed 0 is mobile
+fixed_bed_gsd_nodes = np.zeros_like(z)   
+fixed_bed_gsd_nodes[fixed_bed_gsd_nodes_id] = 1
+# Creates the fixed imposed sediment supply GSD at links
+qb_gsd_imposed = np.zeros([rmg.number_of_links,gsd.shape[0]-1])
+qb_gsd_imposed[in_l] = qb_gsd_imposed0
+
+rbd = RiverBedDynamics(rmg,
+						gsd = gsd,
+						variable_critical_shear_stress = False, 
+						outlet_boundary_condition='fixedValue',
+						bedload_equation ='WongAndParker',
+						bed_surf__elev_fix_node=fixed_nodes,
+						bed_surf__gsd_fix_node=fixed_bed_gsd_nodes,
+						sed_transp__bedload_rate_fix_link=qb,
+						sed_transp__bedload_gsd_fix_link=qb_gsd_imposed)
+
+""" Initial Conditions """
+progress0 = 0
+while t0 < sim_max_t_0:
+    
+    of.overland_flow(dt=max_dt)  # Runs overland flow for one time step
+
+    t0 += of.dt
+    
+    progress = int((t0 / sim_max_t_0) * 100)
+    if progress > progress0 + 1:
+        print("\n" + "Filling channel - Time : " + str(t0) + " sec - Water depth at study section outlet " + str(round(of._h[100], 3)) + " m", end="")
+        progress0 = progress
+   
+print(' ')
+print('Filling channel - Done - Now entering the coupled hydraulic/morphodynamics model')
+print(' ')
+
+# Velocity at current time    
+rmg["link"]["surface_water__velocity"] = rmg["link"]["surface_water__discharge"] / rmg["link"]["surface_water__depth"]
+
+""" Data for the evolution plot """
+n_col = rmg.number_of_node_columns
+x0 = rmg._xy_of_lower_left[0]
+dx = rmg._spacing[0]
+xf = x0 + dx*n_col
+x = np.arange(x0,xf,dx)
+
+def plotCurrentBedState():
+
+    zAll = np.loadtxt('output/output3_node_topographic__elevation.txt')[:,1:]
+    z0 = zAll[0,:]
+    zPrevious = zAll[1:-1,:]
+    zCurrent = zAll[-1,:] 
+    
+    """ Plot to analyze evlution of bed elevation """
+    if zPrevious.shape[0] > 0:
+        # Create a figure and axis
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(x,z0, color='black', label='Initial Condition')
+        
+        # Plot zPrevious
+        num_rows = zPrevious.shape[0]
+        colors = cm.Greys(np.linspace(0.3, 0.7, num_rows))
+        for row in zPrevious:
+            ax.plot(x,row, color=colors[num_rows-1])  # plotting in grayscale without labels
+            num_rows -= 1  # reduce the grayscale for next iteration
+        
+        # Plot zCurrent
+        ax.plot(x,zCurrent, color='tab:orange', label='Current', linestyle='--')
+        
+        # Display legend
+        ax.legend(); ax.set_title("Elevation Comparison"); ax.set_xlabel("Streamwise distance [m]"); ax.set_ylabel("Elevation")
+        ax.set_xlim(0, 1750)
+        ax.set_ylim(0, 60)
+        plt.tight_layout();
+        #plt.savefig('elevationDynamics',dpi=300); plt.close()
+        plt.show()
+
+""" Defines some variables to store data"""
+save_data_now = True
+plot_now = True                          # Used to save the plot at time zero
+check_maximum_time = True
+plot_time_interval_original = copy.deepcopy(plot_time_interval)         # A copy of plot_time_interval
+save_data_time_interval_original=copy.deepcopy(save_data_time_interval) # A copy of save_data_time_interval
+topographic__elevation_original = copy.deepcopy(rmg["node"]["topographic__elevation"]) # A copy of the original topographic__elevation
+
+progress0 = 0  # Initializates the variable
+while t < sim_max_t:
+    
+    # defines the velocity at previous time    
+    rbd._surface_water__velocity_prev_time_link = of._grid["link"]["surface_water__discharge"] / of._grid["link"]["surface_water__depth"]
+
+    # Runs overland flow for one time step      
+    of.overland_flow(dt=max_dt) 
+
+    # defines the velocity at current time        
+    rmg["link"]["surface_water__velocity"] = rmg["link"]["surface_water__discharge"] / rmg["link"]["surface_water__depth"]
+    
+    # Defines the time step used in RiverBedDynamics
+    rbd._grid._dt = of.dt
+    
+    # Runs RiverBedDynamics for one time step      
+    rbd.run_one_step()  # Runs riverBedDynamics for one time step
+    
+    for i in calc_node_id:
+        rmg['node']['topographic__elevation'][i] = rmg['node']['topographic__elevation'][i+1]
+   
+    ## Stores results
+    save_data_time_interval = round(save_data_time_interval-of.dt, dt_precision)
+    if (save_data_time_interval <=0) or save_data_now:
+        os.chdir(output_folder)
+        print('\n Storing results at time :',np.round(t,1),' s \n')
+
+        # Discharge in m3/s
+        field = np.abs(of._q[link_list] * rmg.dx)
+        data = np.reshape(np.hstack([t,(field.T)]),[1,link_list.shape[0]+1])
+        with open("output0_link_surface_water__discharge.txt", "ab") as f:
+            np.savetxt(f, data,'%.3f')  
+            
+        # water depth
+        field = of._h[node_list]
+        data = np.reshape(np.hstack([t,(field.T)]),[1,node_list.shape[0]+1])
+        with open("output1_node_surface_water__depth.txt", "ab") as f:
+            np.savetxt(f, data,'%.3f')         
+        
+        # shear stress
+        field = np.abs(rbd._surface_water__shear_stress_link[link_list])
+        data = np.reshape(np.hstack([t,(field.T)]),[1,link_list.shape[0]+1])       
+        with open("output2_link_surface_water__shear_stress.txt", "ab") as f:
+            np.savetxt(f, data,'%.3f')          
+            
+        # Topographic elevation            
+        field = rmg.at_node["topographic__elevation"][node_list]          
+        data = np.reshape(np.hstack([t,field.T]),[1,node_list.shape[0]+1])
+        with open("output3_node_topographic__elevation.txt", "ab") as f:
+            np.savetxt(f, data,'%.3f')
+        
+        # bed surface median grain size
+        field = rbd._bed_surf__median_size_node[link_list]           
+        data = np.reshape(np.hstack([t,field.T]),[1,link_list.shape[0]+1])
+        with open("output4_node_bed_surface__median_size.txt", "ab") as f:
+            np.savetxt(f, data,'%.3f')                
+        
+        # sediment transport bedload rate
+        field = rbd._sed_transp__bedload_rate_link[link_list]
+        data = np.reshape(np.hstack([t,(field.T)]),[1,link_list.shape[0]+1])        
+        with open("output5_link_sediment_transport__bedload_rate.txt", "ab") as f:
+            np.savetxt(f, data,'%.5f')        
+ 
+        save_data_time_interval = round(save_data_time_interval_original, dt_precision)
+        save_data_now = False
+        os.chdir(cwd)
+
+    plot_time_interval = round(plot_time_interval-of.dt, dt_precision)
+    if plot_time_interval <= 0  or plot_now:
+        os.chdir(output_folder)
+        print('\n Elapsed time :',np.round(t,1),' s. Current dt =', np.round(of.dt,1),' s - Saving plot \n')
+        
+        # Water depth plot
+        plot_name='Surface water depth [m] at ' + str(np.round(t,0)) + ' sec'
+        imshow_grid(rmg, 'surface_water__depth',cmap='Blues',vmin=0,vmax=0.5,plot_name=plot_name)
+        output='depth_'+str(np.round(t,0))+'.png'
+        plt.savefig(output,dpi=300); plt.close()  
+
+        #Bed surface elevation plot
+        plot_name='Bed surface elevation [m] at ' + str(np.round(t,0)) + ' sec'
+        ZBed = rmg.at_node["topographic__elevation"]
+        imshow_grid(rmg, ZBed ,cmap='RdGy',vmin=0,vmax=40,plot_name=plot_name)
+        output='topographicElevation_'+str(np.round(t,0))+'.png'
+        plt.savefig(output,dpi=300); plt.close()  
+        
+        #Bed surface variation plot
+        plot_name='Bed surface elevation variation [m] at ' + str(np.round(t,0)) + ' sec'
+        ZVar = rmg.at_node["topographic__elevation"] - topographic__elevation_original 
+        imshow_grid(rmg, ZVar,cmap='RdGy',vmin=-25,vmax=25,plot_name=plot_name)
+        output='topographicVariation_'+str(np.round(t,0))+'.png'
+        plt.savefig(output,dpi=300); plt.close()
+
+        plot_now = False
+        plot_time_interval = plot_time_interval_original
+        os.chdir(cwd)
+                
+        if t > 0:
+            plotCurrentBedState()
+            
+    # Updating t
+    if (t + of.dt > sim_max_t) and check_maximum_time:
+        of.dt = sim_max_t - t
+        t = sim_max_t
+        storeDataNow = True  
+        plot_now = True
+        check_maximum_time = False
+    else:
+        t += of.dt
+        progress = int((t / sim_max_t) * 100)
+        if progress > progress0 + 1:
+            print("\r" + f"Progress: [{progress}%]", end="")
+            progress0 = progress
+    
+    
